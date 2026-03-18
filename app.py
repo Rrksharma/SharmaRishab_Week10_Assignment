@@ -14,6 +14,7 @@ import streamlit as st
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 CHATS_DIR = Path("chats")
+MEMORY_PATH = Path("memory.json")
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 
@@ -94,12 +95,72 @@ def load_chats() -> dict[str, dict[str, Any]]:
     )
 
 
+def load_memory() -> dict[str, Any]:
+    if not MEMORY_PATH.exists():
+        return {}
+    try:
+        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_memory(memory: dict[str, Any]) -> None:
+    MEMORY_PATH.write_text(json.dumps(memory, indent=2), encoding="utf-8")
+
+
+def reset_memory() -> None:
+    st.session_state.memory = {}
+    save_memory(st.session_state.memory)
+
+
+def normalize_memory_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        cleaned = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text and text not in cleaned:
+                    cleaned.append(text)
+        return cleaned
+    return value
+
+
+def merge_memory(existing: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in updates.items():
+        normalized = normalize_memory_value(value)
+        if normalized in ("", [], None):
+            continue
+
+        current = merged.get(key)
+        if isinstance(current, list) and isinstance(normalized, list):
+            merged[key] = list(dict.fromkeys([*current, *normalized]))
+        elif isinstance(current, list) and isinstance(normalized, str):
+            merged[key] = list(dict.fromkeys([*current, normalized]))
+        elif isinstance(current, str) and isinstance(normalized, list):
+            merged[key] = list(dict.fromkeys([current, *normalized]))
+        else:
+            merged[key] = normalized
+    return merged
+
+
+def format_memory_for_prompt(memory: dict[str, Any]) -> str:
+    if not memory:
+        return ""
+    return json.dumps(memory, indent=2)
+
+
 def init_state() -> None:
     if "chats" not in st.session_state:
         st.session_state.chats = load_chats()
     if "active_chat_id" not in st.session_state:
         chat_ids = list(st.session_state.chats.keys())
         st.session_state.active_chat_id = chat_ids[0] if chat_ids else None
+    if "memory" not in st.session_state:
+        st.session_state.memory = load_memory()
 
 
 def create_chat(make_active: bool = True) -> str:
@@ -141,7 +202,15 @@ def get_hf_token() -> str | None:
 
 
 def build_api_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    return [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+    memory_text = format_memory_for_prompt(st.session_state.memory)
+    system_content = SYSTEM_PROMPT
+    if memory_text:
+        system_content += (
+            "\n\nKnown user memory for personalization:\n"
+            f"{memory_text}\n"
+            "Use this memory only when it is relevant to the user's request."
+        )
+    return [{"role": "system", "content": system_content}, *messages]
 
 
 def explain_http_error(exc: requests.HTTPError) -> str:
@@ -156,6 +225,44 @@ def explain_http_error(exc: requests.HTTPError) -> str:
         return "The Hugging Face service is having trouble right now. Please try again shortly."
     body = response.text.strip()
     return f"API error {response.status_code}: {body or 'No error details were returned.'}"
+
+
+def request_json_completion(messages: list[dict[str, str]], hf_token: str) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": 160,
+    }
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    content = data["choices"][0]["message"]["content"].strip()
+    parsed = json.loads(content)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def extract_user_memory(user_text: str, hf_token: str) -> dict[str, Any]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Extract stable user traits or preferences from the user's message. "
+                "Return only a JSON object. "
+                "Use short keys like name, interests, favorite_topics, preferred_language, "
+                "communication_style, location, or goals when relevant. "
+                "If nothing useful is present, return {}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": user_text,
+        },
+    ]
+    return request_json_completion(messages, hf_token)
 
 
 def extract_stream_text(event: dict[str, Any]) -> str:
@@ -221,6 +328,15 @@ def render_sidebar() -> None:
         if st.button("New Chat", use_container_width=True, type="primary"):
             create_chat(make_active=True)
             st.rerun()
+
+        with st.expander("User Memory", expanded=True):
+            if st.session_state.memory:
+                st.json(st.session_state.memory)
+            else:
+                st.caption("No saved memory yet.")
+            if st.button("Clear Memory", use_container_width=True):
+                reset_memory()
+                st.rerun()
 
         st.caption("Saved chats")
 
@@ -306,6 +422,18 @@ def send_message(user_text: str, hf_token: str | None) -> None:
     chat["messages"].append({"role": "assistant", "content": assistant_text})
     save_chat(chat)
     reorder_chats()
+
+    try:
+        extracted_memory = extract_user_memory(user_text, hf_token)
+    except requests.HTTPError:
+        return
+    except requests.RequestException:
+        return
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return
+
+    st.session_state.memory = merge_memory(st.session_state.memory, extracted_memory)
+    save_memory(st.session_state.memory)
 
 
 st.set_page_config(page_title="My AI Chat", layout="wide")
