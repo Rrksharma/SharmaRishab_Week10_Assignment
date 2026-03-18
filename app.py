@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,25 @@ def explain_http_error(exc: requests.HTTPError) -> str:
     return f"API error {response.status_code}: {body or 'No error details were returned.'}"
 
 
-def request_chat_completion(messages: list[dict[str, str]], hf_token: str) -> str:
+def extract_stream_text(event: dict[str, Any]) -> str:
+    choices = event.get("choices") or []
+    if not choices:
+        return ""
+
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict)
+        )
+    return ""
+
+
+def stream_chat_completion(messages: list[dict[str, str]], hf_token: str):
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
@@ -166,11 +185,34 @@ def request_chat_completion(messages: list[dict[str, str]], hf_token: str) -> st
         "model": MODEL_NAME,
         "messages": build_api_messages(messages),
         "max_tokens": 512,
+        "stream": True,
     }
-    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    with requests.post(
+        API_URL,
+        headers=headers,
+        json=payload,
+        timeout=60,
+        stream=True,
+    ) as response:
+        response.raise_for_status()
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line or not raw_line.startswith("data:"):
+                continue
+
+            data = raw_line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                break
+
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            chunk = extract_stream_text(event)
+            if chunk:
+                yield chunk
+                time.sleep(0.02)
 
 
 def render_sidebar() -> None:
@@ -205,14 +247,10 @@ def render_sidebar() -> None:
 def render_empty_state(hf_token: str | None) -> None:
     st.info("Start a new conversation from the input bar below, or run a quick API test.")
     if st.button('Send test message: "Hello!"'):
-        if not hf_token:
-            st.error(
-                "Missing Hugging Face token. Add `HF_TOKEN` to `.streamlit/secrets.toml` "
-                "or Streamlit Community Cloud secrets."
-            )
-            return
         if st.session_state.active_chat_id is None:
             create_chat(make_active=True)
+        with st.chat_message("user"):
+            st.write("Hello!")
         send_message("Hello!", hf_token)
         st.rerun()
 
@@ -227,13 +265,6 @@ def render_chat(chat: dict[str, Any]) -> None:
 
 
 def send_message(user_text: str, hf_token: str | None) -> None:
-    if not hf_token:
-        st.error(
-            "Missing Hugging Face token. Add `HF_TOKEN` to `.streamlit/secrets.toml` "
-            "or Streamlit Community Cloud secrets."
-        )
-        return
-
     active_chat_id = st.session_state.active_chat_id
     if active_chat_id is None:
         active_chat_id = create_chat(make_active=True)
@@ -243,22 +274,33 @@ def send_message(user_text: str, hf_token: str | None) -> None:
     save_chat(chat)
     reorder_chats()
 
+    if not hf_token:
+        st.error(
+            "Missing Hugging Face token. Add `HF_TOKEN` to `.streamlit/secrets.toml` "
+            "or Streamlit Community Cloud secrets."
+        )
+        return
+
     try:
-        assistant_text = request_chat_completion(chat["messages"], hf_token)
+        with st.chat_message("assistant"):
+            assistant_text = st.write_stream(
+                stream_chat_completion(chat["messages"], hf_token)
+            )
     except requests.HTTPError as exc:
-        chat["messages"].pop()
-        save_chat(chat)
         st.error(explain_http_error(exc))
         return
     except requests.RequestException as exc:
-        chat["messages"].pop()
-        save_chat(chat)
         st.error(f"Network error: {exc}")
         return
     except (KeyError, IndexError, TypeError, ValueError):
-        chat["messages"].pop()
-        save_chat(chat)
         st.error("The API returned an unexpected response format.")
+        return
+
+    if not isinstance(assistant_text, str):
+        assistant_text = "".join(assistant_text)
+
+    if not assistant_text.strip():
+        st.error("The API stream completed without returning any assistant text.")
         return
 
     chat["messages"].append({"role": "assistant", "content": assistant_text})
@@ -296,5 +338,7 @@ else:
         render_empty_state(hf_token)
 
 if prompt := st.chat_input("Message the assistant"):
+    with st.chat_message("user"):
+        st.write(prompt)
     send_message(prompt, hf_token)
     st.rerun()
